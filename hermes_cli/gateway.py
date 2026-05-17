@@ -3104,6 +3104,8 @@ def _guard_official_docker_root_gateway() -> None:
         return
     if _truthy_env(os.getenv("HERMES_ALLOW_ROOT_GATEWAY")):
         return
+    if _truthy_env(os.getenv("HERMES_ROOTLESS_PODMAN")):
+        return  # Rootless Podman mode - user namespace provides isolation
     if not _is_official_docker_checkout():
         return
 
