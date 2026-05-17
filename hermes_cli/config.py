@@ -2730,6 +2730,14 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "setting",
     },
+    "HERMES_ROOTLESS": {
+        "description": "Enable rootless Podman mode: run as root inside container, skip chown, allow gateway",
+        "prompt": "Rootless Podman mode (HERMES_ROOTLESS)",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
 }
 
 # Tool Gateway env vars are always visible — they're useful for

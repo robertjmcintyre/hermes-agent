@@ -54,6 +54,51 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 
+
+def _is_running_in_user_namespace() -> bool:
+    """Check if we're running inside a user namespace (rootless container).
+    
+    Returns True if we're in rootless Podman (UID 0 inside maps to unprivileged
+    user on host). Returns False if we're running as actual root (full UID range).
+    
+    Used to allow gateway to run when HERMES_ROOTLESS=1 in rootless Podman,
+    while blocking it when running as actual root for security.
+    """
+    try:
+        with open('/proc/self/uid_map') as f:
+            content = f.read().strip()
+            # Rootless containers have a mapping like: "0 1000 1" (mapped UID != 0)
+            # Rootful containers have: "0 0 4294967295" (full range, mapped UID == 0)
+            parts = content.split()
+            if len(parts) >= 3 and parts[1] != parts[0]:
+                return True  # Mapped UID - rootless podman
+            return False
+    except Exception:
+        return False
+
+
+def _check_root_gateway_security() -> None:
+    """Check if gateway is running as actual root and block if so.
+    
+    Allows gateway to run when:
+    - Not running as root (UID != 0)
+    - Running in rootless Podman (UID 0 inside, but user namespace mapping)
+    
+    Blocks gateway when running as actual root (UID 0, no user namespace).
+    """
+    if os.getuid() != 0:
+        return  # Not root, all good
+    
+    if _is_running_in_user_namespace():
+        return  # Rootless Podman, allow it
+    
+    # Running as actual root - block gateway
+    print("""ERROR: Gateway cannot run as root.
+       - If using rootless Podman, set HERMES_ROOTLESS=1
+       - If using Docker, do not run as root (remove --user 0)
+       - Gateway requires non-root user for security""", file=sys.stderr)
+    sys.exit(1)
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -17104,6 +17149,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
+    # Check for root execution (block unless in rootless Podman)
+    _check_root_gateway_security()
+    
     # Force UTF-8 stdio on Windows — gateway logs and startup banner would
     # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.
     try:

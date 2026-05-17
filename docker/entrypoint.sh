@@ -9,8 +9,8 @@ INSTALL_DIR="/opt/hermes"
 # When started as root (the default for Docker, or fakeroot in rootless Podman),
 # optionally remap the hermes user/group to match host-side ownership, fix volume
 # permissions, then re-exec as hermes.
-# Set HERMES_SKIP_USER_SWITCH=1 to run as root (not recommended for production).
-if [ "$(id -u)" = "0" ] && [ "${HERMES_SKIP_USER_SWITCH:-}" != "1" ]; then
+# Set HERMES_ROOTLESS=1 for rootless Podman to skip user switch + chown and run as root inside.
+if [ "$(id -u)" = "0" ] && [ "${HERMES_ROOTLESS:-}" != "1" ]; then
     if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
         echo "Changing hermes UID to $HERMES_UID"
         usermod -u "$HERMES_UID" hermes
@@ -26,8 +26,8 @@ if [ "$(id -u)" = "0" ] && [ "${HERMES_SKIP_USER_SWITCH:-}" != "1" ]; then
     # Fix ownership of the data volume. When HERMES_UID remaps the hermes user,
     # files created by previous runs (under the old UID) become inaccessible.
     # Always chown -R when UID was remapped; otherwise only if top-level is wrong.
-    # Set HERMES_SKIP_CHOWN=1 to skip (e.g., when running as root inside rootless podman).
-    if [ "${HERMES_SKIP_CHOWN:-}" != "1" ]; then
+    # Skip chown entirely when HERMES_ROOTLESS=1 (rootless Podman).
+    if [ "${HERMES_ROOTLESS:-}" != "1" ]; then
         actual_hermes_uid=$(id -u hermes)
         needs_chown=false
         if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "10000" ]; then
@@ -53,15 +53,17 @@ if [ "$(id -u)" = "0" ] && [ "${HERMES_SKIP_USER_SWITCH:-}" != "1" ]; then
     # edited on the host after initial ownership setup. Must run here (as root)
     # rather than after the gosu drop, otherwise a non-root caller like
     # `docker run -u $(id -u):$(id -g)` hits "Operation not permitted" (#15865).
-    if [ "${HERMES_SKIP_CHOWN:-}" != "1" ] && [ -f "$HERMES_HOME/config.yaml" ]; then
+    # Skip when HERMES_ROOTLESS=1.
+    if [ "${HERMES_ROOTLESS:-}" != "1" ] && [ -f "$HERMES_HOME/config.yaml" ]; then
         chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
         chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     fi
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
-elif [ "$(id -u)" = "0" ] && [ "${HERMES_SKIP_USER_SWITCH:-}" = "1" ]; then
-    echo "WARNING: Running as root (HERMES_SKIP_USER_SWITCH=1) - not recommended for production"
+elif [ "$(id -u)" = "0" ] && [ "${HERMES_ROOTLESS:-}" = "1" ]; then
+    echo "Running as root inside container (HERMES_ROOTLESS=1) — rootless Podman detected"
+fi
 fi
 
 # --- Running as hermes from here ---
