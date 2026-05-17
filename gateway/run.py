@@ -61,7 +61,7 @@ def _is_running_in_user_namespace() -> bool:
     Returns True if we're in rootless Podman (UID 0 inside maps to unprivileged
     user on host). Returns False if we're running as actual root (full UID range).
     
-    Used to allow gateway to run when HERMES_ROOTLESS=1 in rootless Podman,
+    Used to allow gateway to run when HERMES_ROOTLESS_PODMAN=1 in rootless Podman,
     while blocking it when running as actual root for security.
     """
     try:
@@ -94,7 +94,7 @@ def _check_root_gateway_security() -> None:
     
     # Running as actual root - block gateway
     print("""ERROR: Gateway cannot run as root.
-       - If using rootless Podman, set HERMES_ROOTLESS=1
+       - If using rootless Podman, set HERMES_ROOTLESS_PODMAN=1
        - If using Docker, do not run as root (remove --user 0)
        - Gateway requires non-root user for security""", file=sys.stderr)
     sys.exit(1)

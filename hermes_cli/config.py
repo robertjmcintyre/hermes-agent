@@ -2730,9 +2730,9 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "setting",
     },
-    "HERMES_ROOTLESS": {
+    "HERMES_ROOTLESS_PODMAN": {
         "description": "Enable rootless Podman mode: run as root inside container, skip chown, allow gateway",
-        "prompt": "Rootless Podman mode (HERMES_ROOTLESS)",
+        "prompt": "Rootless Podman mode (HERMES_ROOTLESS_PODMAN)",
         "url": None,
         "password": False,
         "category": "setting",
