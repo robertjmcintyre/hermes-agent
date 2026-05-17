@@ -64,7 +64,6 @@ if [ "$(id -u)" = "0" ] && [ "${HERMES_ROOTLESS_PODMAN:-}" != "1" ]; then
 elif [ "$(id -u)" = "0" ] && [ "${HERMES_ROOTLESS_PODMAN:-}" = "1" ]; then
     echo "Running as root inside container (HERMES_ROOTLESS_PODMAN=1) — rootless Podman detected"
 fi
-fi
 
 # --- Running as hermes from here ---
 source "${INSTALL_DIR}/.venv/bin/activate"
