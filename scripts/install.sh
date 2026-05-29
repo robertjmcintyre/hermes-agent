@@ -45,6 +45,10 @@ BOLD='\033[1m'
 # Configuration
 REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+if [ -n "${HERMES_REPO_URL:-}" ]; then
+    REPO_URL_SSH="$HERMES_REPO_URL"
+    REPO_URL_HTTPS="$HERMES_REPO_URL"
+fi
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -102,6 +106,11 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repo)
+            REPO_URL_SSH="$2"
+            REPO_URL_HTTPS="$2"
+            shift 2
+            ;;
         --dir)
             INSTALL_DIR="$2"
             INSTALL_DIR_EXPLICIT=true
@@ -129,6 +138,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-setup   Skip interactive setup wizard"
             echo "  --skip-browser Skip Playwright/Chromium install (browser tools won't work)"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repo URL     Git repository URL (default: https://github.com/NousResearch/hermes-agent.git)"
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
@@ -959,6 +969,24 @@ clone_repo() {
                     log_info "Restore manually with: git stash apply $autostash_ref"
                 fi
             fi
+        elif [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+            # Directory exists but is empty — treat as fresh install
+            log_info "Empty directory, cloning fresh..."
+            if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
+               git clone --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+                log_success "Cloned via SSH"
+            else
+                rm -rf "$INSTALL_DIR" 2>/dev/null
+                log_info "SSH failed, trying HTTPS..."
+                if git clone --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+                    log_success "Cloned via HTTPS"
+                else
+                    log_error "Failed to clone repository"
+                    exit 1
+                fi
+            fi
+            cd "$INSTALL_DIR"
+            log_success "Repository ready"
         else
             log_error "Directory exists but is not a git repository: $INSTALL_DIR"
             log_info "Remove it or choose a different directory with --dir"
@@ -2049,6 +2077,20 @@ main() {
 
     detect_os
     resolve_install_layout
+
+    # When installing to a non-HOME location (e.g., /opt/hermes-agent),
+    # store uv's Python cache under the install directory to avoid
+    # SELinux/systemd restrictions on executing code from /home or /root.
+    if [ "$INSTALL_DIR_EXPLICIT" = true ]; then
+        case "$INSTALL_DIR" in
+            /opt/*|/usr/local/*|/srv/*)
+                export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$INSTALL_DIR/.uv-python}"
+                export UV_PYTHON_BIN_DIR="${UV_PYTHON_BIN_DIR:-$INSTALL_DIR/.uv-bin}"
+                log_info "uv Python: $UV_PYTHON_INSTALL_DIR (install directory)"
+                ;;
+        esac
+    fi
+
     install_uv
     check_python
     check_git
