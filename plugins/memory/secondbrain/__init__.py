@@ -1,0 +1,624 @@
+"""Secondbrain memory plugin — MemoryProvider for Secondbrain.
+
+Provides persistent memory storage via the Secondbrain MCP server.
+Secondbrain is a file-based memory system with ChromaDB vector search.
+
+The plugin communicates with the Secondbrain MCP server over HTTP to:
+- Read/write memory documents
+- Search memories using semantic similarity
+- Track conversation turns
+
+Config: Uses the existing Secondbrain config chain:
+  1. $HERMES_HOME/secondbrain.json (profile-scoped)
+  2. Environment variables (SECONDBRAIN_URL, SECONDBRAIN_API_KEY)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from agent.memory_manager import sanitize_context
+from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
+READ_SCHEMA = {
+    "name": "secondbrain_read",
+    "description": (
+        "Read a specific memory document by its ID. "
+        "Use this to retrieve full content of a known memory. "
+        "If you don't know the document ID, use secondbrain_search instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "The document ID to read (e.g., 'sessions/my-session' or 'projects/architecture')",
+            },
+        },
+        "required": ["doc_id"],
+    },
+}
+
+SEARCH_SCHEMA = {
+    "name": "secondbrain_search",
+    "description": (
+        "Search memories using semantic similarity. "
+        "Best for finding relevant past context when you don't know the document ID. "
+        "Returns ranked results with relevance scores."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to search for in memories",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results (default: 10)",
+                "default": 10,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+WRITE_SCHEMA = {
+    "name": "secondbrain_write",
+    "description": (
+        "Create a new memory document. Fails if document already exists. "
+        "Use this for new, standalone memories. "
+        "For ongoing conversations, use secondbrain_update to append to existing documents."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "Unique document ID (e.g., 'projects/my-project', 'notes/idea-1')",
+            },
+            "content": {
+                "type": "string",
+                "description": "Memory content to store",
+            },
+            "doc_type": {
+                "type": "string",
+                "description": "Document type (default: 'generic')",
+                "default": "generic",
+            },
+        },
+        "required": ["doc_id", "content"],
+    },
+}
+
+UPDATE_SCHEMA = {
+    "name": "secondbrain_update",
+    "description": (
+        "Append new content to an existing memory document. "
+        "Use this for ongoing conversations or adding to existing memories. "
+        "If the document doesn't exist, you must create it first with secondbrain_write."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "Document ID to update",
+            },
+            "content": {
+                "type": "string",
+                "description": "Content to append",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional frontmatter updates",
+            },
+        },
+        "required": ["doc_id"],
+    },
+}
+
+BACKLINKS_SCHEMA = {
+    "name": "secondbrain_backlinks",
+    "description": (
+        "Get documents that link to a given document. "
+        "Useful for understanding relationships between memories."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "The document ID to find backlinks for",
+            },
+        },
+        "required": ["doc_id"],
+    },
+}
+
+REFERENCES_SCHEMA = {
+    "name": "secondbrain_references",
+    "description": (
+        "Get documents that a given document links to. "
+        "Useful for understanding what a memory references."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "The document ID to get references for",
+            },
+        },
+        "required": ["doc_id"],
+    },
+}
+
+ALL_TOOL_SCHEMAS = [
+    READ_SCHEMA,
+    SEARCH_SCHEMA,
+    WRITE_SCHEMA,
+    UPDATE_SCHEMA,
+    BACKLINKS_SCHEMA,
+    REFERENCES_SCHEMA,
+]
+
+
+# ---------------------------------------------------------------------------
+# HTTP Client
+# ---------------------------------------------------------------------------
+
+class SecondbrainClient:
+    """HTTP client for the Secondbrain MCP server."""
+
+    def __init__(self, base_url: str, api_key: Optional[str] = None, timeout: int = 30):
+        self.base_url = base_url.rstrip("/")
+        self.mcp_url = f"{self.base_url}/mcp"
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get request headers including optional API key."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def call_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
+        """Call an MCP tool via the server's tool invocation endpoint.
+        
+        Uses the MCP library's ClientSession for proper protocol handling
+        with streamable-http transport. Falls back to simple HTTP if:
+        - SECONDBRAIN_USE_SIMPLE_HTTP env var is set
+        - MCP library is not available
+        - MCP call fails for any reason
+        """
+        # Check if we should skip MCP and use simple HTTP directly
+        if os.environ.get("SECONDBRAIN_USE_SIMPLE_HTTP"):
+            return self._call_tool_simple(tool_name, **kwargs)
+        
+        # Try to use MCP library first
+        try:
+            import asyncio
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
+
+            async def _call_tool():
+                async with streamablehttp_client(self.mcp_url + "/") as (read, write, _), \
+                     ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, kwargs)
+                    # Extract content from MCP response
+                    if hasattr(result, 'content') and result.content:
+                        # Parse the text content
+                        text_content = result.content[0].text if result.content else ""
+                        try:
+                            parsed = json.loads(text_content)
+                            # Check if the parsed content contains an error
+                            if isinstance(parsed, dict):
+                                if "error" in parsed:
+                                    return parsed
+                            return parsed
+                        except (json.JSONDecodeError, AttributeError):
+                            # Check if the content is an error message
+                            lower_content = text_content.lower()
+                            if any(err in lower_content for err in ["error", "invalid", "unknown", "not found", "failed"]):
+                                return {"error": text_content}
+                            return {"content": text_content}
+                    return {"error": "No result from tool call"}
+
+            return asyncio.run(_call_tool())
+        except ImportError:
+            # Fallback to simple HTTP if mcp library not available
+            pass
+        except Exception as e:
+            # If MCP fails, try fallback (e.g., in tests where mocks aren't perfect)
+            logger.debug(f"MCP call failed, trying fallback: {e}")
+        
+        # Fallback to simple HTTP
+        return self._call_tool_simple(tool_name, **kwargs)
+
+    def _call_tool_simple(self, tool_name: str, **kwargs) -> Dict[str, Any]:
+        """Fallback simple HTTP call for non-streamable-http transports."""
+        try:
+            response = requests.post(
+                self.mcp_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": kwargs,
+                    },
+                },
+                headers=self._get_headers(),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Handle MCP response format
+            if "result" in result:
+                return result["result"]
+            elif "error" in result:
+                return {"error": result["error"]}
+            return result
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Secondbrain connection failed: {e}")
+            return {"error": f"Cannot connect to Secondbrain server at {self.base_url}"}
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Secondbrain request timed out: {e}")
+            return {"error": "Request to Secondbrain timed out"}
+        except Exception as e:
+            logger.error(f"Secondbrain request failed: {e}")
+            return {"error": str(e)}
+
+    def health_check(self) -> bool:
+        """Check if the MCP server is healthy."""
+        try:
+            result = self.call_tool("health_check")
+            return result.get("status") == "healthy"
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# MemoryProvider implementation
+# ---------------------------------------------------------------------------
+
+class SecondbrainMemoryProvider(MemoryProvider):
+    """Secondbrain memory provider using MCP server over HTTP."""
+
+    def __init__(self):
+        self._client: Optional[SecondbrainClient] = None
+        self._session_id: str = ""
+        self._hermes_home: Optional[Path] = None
+        self._sync_thread: Optional[threading.Thread] = None
+        self._turn_count: int = 0
+        self._prefetch_result: str = ""
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_thread: Optional[threading.Thread] = None
+
+    @property
+    def name(self) -> str:
+        return "secondbrain"
+
+    def is_available(self) -> bool:
+        """Check if Secondbrain is configured. No network calls."""
+        # Check environment variables or config file
+        url = os.environ.get("SECONDBRAIN_URL")
+        if not url:
+            # Try to load from config
+            try:
+                from hermes_constants import get_hermes_home
+                config_path = get_hermes_home() / "secondbrain.json"
+                if config_path.exists():
+                    config = json.loads(config_path.read_text())
+                    url = config.get("url")
+            except Exception:
+                pass
+        
+        return bool(url)
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        """Return config fields for hermes memory setup."""
+        return [
+            {
+                "key": "url",
+                "description": "Secondbrain MCP server URL",
+                "default": "http://localhost:18764",
+                "required": True,
+            },
+            {
+                "key": "api_key",
+                "description": "Secondbrain API key (optional)",
+                "secret": True,
+                "env_var": "SECONDBRAIN_API_KEY",
+            },
+        ]
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Write config to $HERMES_HOME/secondbrain.json."""
+        config_path = Path(hermes_home) / "secondbrain.json"
+        existing = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text())
+            except Exception:
+                pass
+        existing.update(values)
+        config_path.write_text(json.dumps(existing, indent=2))
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Initialize the Secondbrain client."""
+        # Check for cron context - skip memory for cron jobs
+        agent_context = kwargs.get("agent_context", "")
+        platform = kwargs.get("platform", "cli")
+        if agent_context in {"cron", "flush"} or platform == "cron":
+            logger.debug("Secondbrain skipped: cron/flush context")
+            self._client = None
+            return
+
+        self._session_id = session_id
+        self._hermes_home = Path(kwargs.get("hermes_home", str(Path.home() / ".hermes")))
+
+        # Get URL from config or environment
+        url = os.environ.get("SECONDBRAIN_URL")
+        api_key = os.environ.get("SECONDBRAIN_API_KEY")
+
+        if not url:
+            # Try to load from config file
+            config_path = self._hermes_home / "secondbrain.json"
+            if config_path.exists():
+                try:
+                    config = json.loads(config_path.read_text())
+                    url = config.get("url")
+                    api_key = config.get("api_key", api_key)
+                except Exception as e:
+                    logger.warning(f"Failed to load secondbrain config: {e}")
+
+        if not url:
+            logger.warning("Secondbrain not configured - no URL found")
+            self._client = None
+            return
+
+        # Create client
+        self._client = SecondbrainClient(
+            base_url=url,
+            api_key=api_key,
+            timeout=30,
+        )
+
+        # Verify connection
+        if not self._client.health_check():
+            logger.warning("Secondbrain health check failed - provider inactive")
+            self._client = None
+            return
+
+        logger.info(f"Secondbrain initialized with session: {session_id}")
+
+    def system_prompt_block(self) -> str:
+        """Return system prompt text for the provider."""
+        if not self._client:
+            return ""
+        
+        return (
+            "# Secondbrain Memory\n"
+            "Active. Use secondbrain_read, secondbrain_search, secondbrain_write, "
+            "secondbrain_update, secondbrain_backlinks, and secondbrain_references "
+            "tools to access and manage persistent memory. "
+            "Memories are stored in a file-based system with semantic search."
+        )
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Recall relevant context for the upcoming turn."""
+        if not self._client or not query:
+            return ""
+
+        # Run search in background and return cached result
+        # For simplicity, we'll do a quick synchronous search here
+        # In production, you'd want to use queue_prefetch for async
+        try:
+            result = self._client.call_tool("memory_search", query=query, limit=5)
+            if result.get("results"):
+                formatted = "\n\n".join([
+                    f"- {r['doc_id']}: {r.get('chunk_text', '')}"
+                    for r in result["results"]
+                ])
+                return f"Relevant memories:\n{formatted}"
+        except Exception as e:
+            logger.debug(f"Secondbrain prefetch failed: {e}")
+
+        return ""
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Queue a background recall for the next turn."""
+        if not self._client or not query:
+            return
+
+        def _prefetch():
+            try:
+                result = self._client.call_tool("memory_search", query=query, limit=5)
+                if result.get("results"):
+                    formatted = "\n\n".join([
+                        f"- {r['doc_id']}: {r.get('chunk_text', '')}"
+                        for r in result["results"]
+                    ])
+                    with self._prefetch_lock:
+                        self._prefetch_result = f"Relevant memories:\n{formatted}"
+            except Exception as e:
+                logger.debug(f"Secondbrain background prefetch failed: {e}")
+
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
+        
+        self._prefetch_thread = threading.Thread(target=_prefetch, daemon=True, name="secondbrain-prefetch")
+        self._prefetch_thread.start()
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Persist a completed turn to the backend (non-blocking)."""
+        if not self._client:
+            return
+
+        # Use session_id or fall back to stored session
+        effective_session_id = session_id or self._session_id
+        if not effective_session_id:
+            return
+
+        doc_id = f"sessions/{effective_session_id}"
+        content = f"User: {user_content}\nAssistant: {assistant_content}"
+
+        def _sync():
+            try:
+                # Try to update existing document, or create new one
+                result = self._client.call_tool("memory_update", doc_id=doc_id, content=content)
+                if result.get("error") and "not found" in result.get("error", "").lower():
+                    # Document doesn't exist, create it
+                    self._client.call_tool(
+                        "memory_write",
+                        doc_id=doc_id,
+                        content=content,
+                        doc_type="conversation",
+                    )
+            except Exception as e:
+                logger.debug(f"Secondbrain sync_turn failed: {e}")
+
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        
+        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="secondbrain-sync")
+        self._sync_thread.start()
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Track turn count and consume prefetch result."""
+        self._turn_count = turn_number
+        
+        # Consume any pending prefetch result
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush any pending operations on session end."""
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=10.0)
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return tool schemas for the model."""
+        if not self._client:
+            return []
+        return list(ALL_TOOL_SCHEMAS)
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Handle a tool call for one of Secondbrain's tools."""
+        if not self._client:
+            return tool_error("Secondbrain is not active.")
+
+        try:
+            if tool_name == "secondbrain_read":
+                doc_id = args.get("doc_id", "")
+                if not doc_id:
+                    return tool_error("Missing required parameter: doc_id")
+                result = self._client.call_tool("memory_read", doc_id=doc_id)
+                return json.dumps(result)
+
+            elif tool_name == "secondbrain_search":
+                query = args.get("query", "")
+                if not query:
+                    return tool_error("Missing required parameter: query")
+                limit = args.get("limit", 10)
+                result = self._client.call_tool("memory_search", query=query, limit=limit)
+                return json.dumps(result)
+
+            elif tool_name == "secondbrain_write":
+                doc_id = args.get("doc_id", "")
+                content = args.get("content", "")
+                doc_type = args.get("doc_type", "generic")
+                
+                if not doc_id:
+                    return tool_error("Missing required parameter: doc_id")
+                if not content:
+                    return tool_error("Missing required parameter: content")
+                
+                result = self._client.call_tool(
+                    "memory_write",
+                    doc_id=doc_id,
+                    content=content,
+                    doc_type=doc_type,
+                )
+                return json.dumps(result)
+
+            elif tool_name == "secondbrain_update":
+                doc_id = args.get("doc_id", "")
+                content = args.get("content")
+                metadata = args.get("metadata")
+                
+                if not doc_id:
+                    return tool_error("Missing required parameter: doc_id")
+                if not content and not metadata:
+                    return tool_error("Must provide either content or metadata to update")
+                
+                result = self._client.call_tool(
+                    "memory_update",
+                    doc_id=doc_id,
+                    content=content,
+                    metadata=metadata,
+                )
+                return json.dumps(result)
+
+            elif tool_name == "secondbrain_backlinks":
+                doc_id = args.get("doc_id", "")
+                if not doc_id:
+                    return tool_error("Missing required parameter: doc_id")
+                result = self._client.call_tool("memory_backlinks", doc_id=doc_id)
+                return json.dumps(result)
+
+            elif tool_name == "secondbrain_references":
+                doc_id = args.get("doc_id", "")
+                if not doc_id:
+                    return tool_error("Missing required parameter: doc_id")
+                result = self._client.call_tool("memory_references", doc_id=doc_id)
+                return json.dumps(result)
+
+            return tool_error(f"Unknown tool: {tool_name}")
+
+        except Exception as e:
+            logger.error(f"Secondbrain tool {tool_name} failed: {e}")
+            return tool_error(f"Secondbrain {tool_name} failed: {e}")
+
+    def shutdown(self) -> None:
+        """Clean shutdown - flush queues, close connections."""
+        # Wait for sync thread
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        
+        # Wait for prefetch thread
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=3.0)
+        
+        self._client = None
+        logger.info("Secondbrain provider shut down")
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+def register(ctx) -> None:
+    """Register Secondbrain as a memory provider plugin."""
+    ctx.register_memory_provider(SecondbrainMemoryProvider())

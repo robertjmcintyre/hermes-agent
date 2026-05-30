@@ -1,0 +1,6 @@
+name: secondbrain
+version: 1.0.0
+description: "Secondbrain memory provider - file-based memory with ChromaDB vector search"
+hooks:
+  - on_session_end
+  - on_turn_start
